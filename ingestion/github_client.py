@@ -1,13 +1,13 @@
 import os
 import time
 import requests
-from typing import List, Dict, Optional, Generator
+from typing import Dict, Generator, Optional
 from loguru import logger
 
 class GithubCrawler:
     def __init__(self, repo_name: str):
         """
-        repo_name: e.g., 'YourUsername/flagsmith'
+        repo_name: e.g., 'Flagsmith/flagsmith'
         """
         self.repo_name = repo_name
         self.base_url = "https://api.github.com"
@@ -23,7 +23,8 @@ class GithubCrawler:
             "Authorization": f"Bearer {self.token}",
             "X-GitHub-Api-Version": "2022-11-28"
         }
-        # Connection pooling for faster sequential requests
+        
+        # Connection pooling for high-throughput sequential requests
         self.session = requests.Session()
 
     def _get(self, url: str, **kwargs) -> requests.Response:
@@ -31,19 +32,24 @@ class GithubCrawler:
         Bulletproof wrapper: Connection pooling, timeouts, and multi-tier rate limiting.
         """
         kwargs.setdefault("timeout", 30)
+        
+        # Fix: Pop headers before the loop so retries don't lose custom headers
+        req_headers = kwargs.pop("headers", self.headers)
+        
         max_retries = 3
         backoff = 5
+        attempt = 0
         
-        for attempt in range(max_retries):
+        while attempt < max_retries:
             try:
-                response = self.session.get(url, headers=self.headers, **kwargs)
+                response = self.session.get(url, headers=req_headers, **kwargs)
                 
                 # Secondary Rate Limit (Burst protection - 429)
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", backoff))
                     logger.warning(f"Secondary rate limit (429) hit. Sleeping {retry_after}s...")
                     time.sleep(retry_after)
-                    backoff *= 2  # Exponential backoff
+                    # Note: We do NOT increment `attempt` here. Rate limits aren't network failures.
                     continue
                     
                 # Primary Rate Limit (Hourly quota protection - 403)
@@ -57,12 +63,15 @@ class GithubCrawler:
                 response.raise_for_status()
                 return response
                 
-            except requests.exceptions.Timeout:
-                logger.error(f"Timeout on {url} (Attempt {attempt + 1}/{max_retries})")
-                if attempt == max_retries - 1:
+            # Handle both hanging requests and hard network drops
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                attempt += 1
+                logger.error(f"Network error on {url} (Attempt {attempt}/{max_retries}): {e}")
+                if attempt == max_retries:
                     raise
                 time.sleep(backoff)
                 backoff *= 2
+
     def _fetch_paginated_list(self, url: str, params: dict = None) -> list:
         """Helper to exhaust all pages of a list endpoint using response.links."""
         if params is None:
@@ -84,12 +93,12 @@ class GithubCrawler:
 
     def fetch_merged_prs(self, per_page: int = 100) -> Generator[Dict, None, None]:
         """
-        Yields ONLY merged PRs. Handles pagination via the 'Link' header.
-        Using a generator keeps memory usage flat regardless of repo size.
+        Streaming generator that yields ONLY strictly merged PRs.
+        Keeps memory flat regardless of repository size.
         """
         url = f"{self.base_url}/repos/{self.repo_name}/pulls"
         params = {
-            "state": "closed",  # Only closed PRs have a chance of being merged
+            "state": "closed",
             "per_page": per_page,
             "sort": "updated",
             "direction": "desc"
@@ -99,34 +108,24 @@ class GithubCrawler:
         
         while url:
             response = self._get(url, params=params)
-            prs = response.json()
             
-            # Filter and yield ground-truth merged code
-            for pr in prs:
-                if pr.get('merged_at'):
+            for pr in response.json():
+                if pr.get("merged_at") is not None:
                     yield pr
-            
-            # Handle Pagination safely
-            link_header = response.headers.get('Link', '')
-            url = None  # Default to stopping
-            
-            if 'rel="next"' in link_header:
-                links = link_header.split(', ')
-                for link in links:
-                    if 'rel="next"' in link:
-                        # Extract the exact URL between the < > brackets
-                        url = link[link.find('<')+1:link.find('>')]
-                        params = None  # Next URL already contains the params
+                    
+            url = response.links.get("next", {}).get("url")
+            params = {}
 
     def fetch_pr_diff(self, pr_number: int) -> Optional[str]:
-        """Fetches the raw +/- code changes."""
+        """Fetches the raw +/- code changes for RAG context."""
         url = f"{self.base_url}/repos/{self.repo_name}/pulls/{pr_number}"
         
-        #change the Accept header specifically to get the raw diff format
+        # Override Accept header strictly for this request
         diff_headers = self.headers.copy()
         diff_headers["Accept"] = "application/vnd.github.v3.diff"
         
         try:
+            # We explicitly pass the headers override here
             response = self._get(url, headers=diff_headers)
             return response.text
         except requests.exceptions.RequestException as e:

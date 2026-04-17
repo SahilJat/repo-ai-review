@@ -26,28 +26,43 @@ class GithubCrawler:
         # Connection pooling for faster sequential requests
         self.session = requests.Session()
 
-    def _get(self, url: str, headers: dict = None, params: dict = None) -> requests.Response:
+    def _get(self, url: str, **kwargs) -> requests.Response:
         """
-        Wrapper to handle rate limiting seamlessly. Pauses execution if the limit is hit
-        and resumes precisely when GitHub resets the quota.
+        Bulletproof wrapper: Connection pooling, timeouts, and multi-tier rate limiting.
         """
-        req_headers = headers if headers else self.headers
+        kwargs.setdefault("timeout", 30)
+        max_retries = 3
+        backoff = 5
         
-        while True:
-            response = self.session.get(url, headers=req_headers, params=params)
-            
-            # Check for Rate Limit Exception (403 Forbidden with specific headers)
-            if response.status_code == 403 and 'X-RateLimit-Remaining' in response.headers:
-                if int(response.headers.get('X-RateLimit-Remaining', 1)) == 0:
-                    reset_time = int(response.headers.get('X-RateLimit-Reset', time.time() + 60))
-                    sleep_time = max(reset_time - int(time.time()), 0) + 5  # 5-second buffer
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, headers=self.headers, **kwargs)
+                
+                # Secondary Rate Limit (Burst protection - 429)
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", backoff))
+                    logger.warning(f"Secondary rate limit (429) hit. Sleeping {retry_after}s...")
+                    time.sleep(retry_after)
+                    backoff *= 2  # Exponential backoff
+                    continue
                     
-                    logger.warning(f"GitHub rate limit exhausted. Sleeping for {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                    continue  # Retry the exact same request once awake
-            
-            response.raise_for_status()
-            return response
+                # Primary Rate Limit (Hourly quota protection - 403)
+                remaining = int(response.headers.get("X-RateLimit-Remaining", 1))
+                if remaining < 50:
+                    reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
+                    sleep_seconds = max(reset_time - time.time() + 5, 60)
+                    logger.warning(f"Primary rate limit low ({remaining} left). Sleeping {sleep_seconds:.0f}s...")
+                    time.sleep(sleep_seconds)
+
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.Timeout:
+                logger.error(f"Timeout on {url} (Attempt {attempt + 1}/{max_retries})")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(backoff)
+                backoff *= 2
 
     def fetch_merged_prs(self, per_page: int = 100) -> Generator[Dict, None, None]:
         """

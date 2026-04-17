@@ -1,8 +1,13 @@
 import os
 import time
 import requests
-from typing import Dict, Generator, Optional
+from typing import Dict, Generator, List, Optional, TypedDict
 from loguru import logger
+
+class PRCommentsData(TypedDict):
+    """Structured contract for PR comments to ensure downstream stability."""
+    formal_reviews: List[Dict]
+    inline_comments: List[Dict]
 
 class GithubCrawler:
     def __init__(self, repo_name: str):
@@ -132,8 +137,8 @@ class GithubCrawler:
             logger.error(f"Failed to fetch diff for PR #{pr_number}: {e}")
             return None
 
-    def fetch_all_comments(self, pr_number: int) -> dict:
-        """Fetches all formal reviews and inline comments without silent truncation."""
+    def fetch_all_comments(self, pr_number: int) -> PRCommentsData:
+        """Fetches all formal reviews and inline comments with strict type adherence."""
         reviews_url = f"{self.base_url}/repos/{self.repo_name}/pulls/{pr_number}/reviews"
         inline_comments_url = f"{self.base_url}/repos/{self.repo_name}/pulls/{pr_number}/comments"
         
@@ -141,10 +146,10 @@ class GithubCrawler:
             reviews = self._fetch_paginated_list(reviews_url)
             inline = self._fetch_paginated_list(inline_comments_url)
             
-            return {
-                "formal_reviews": reviews,
-                "inline_comments": inline
-            }
+            return PRCommentsData(
+                formal_reviews=reviews,
+                inline_comments=inline
+            )
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch fully paginated comments for PR #{pr_number}: {e}")
             return {"formal_reviews": [], "inline_comments": []}

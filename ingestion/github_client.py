@@ -161,4 +161,4 @@ class GithubCrawler:
             )
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch fully paginated comments for PR #{pr_number}: {e}")
-            return {"formal_reviews": [], "inline_comments": []}
+            return PRCommentsData(formal_reviews=[], inline_comments=[])

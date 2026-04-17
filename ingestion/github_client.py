@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from typing import Dict, Generator, List, Optional, TypedDict
+from typing import Dict, Generator, Optional, List, TypedDict
 from loguru import logger
 
 class PRCommentsData(TypedDict):
@@ -42,9 +42,7 @@ class GithubCrawler:
         logger.debug("GitHub session closed cleanly.")
 
     def _get(self, url: str, **kwargs) -> requests.Response:
-        """
-        Bulletproof wrapper: Connection pooling, timeouts, and multi-tier rate limiting.
-        """
+        """Bulletproof wrapper: Pooling, timeouts, and strict rate limit enforcement."""
         kwargs.setdefault("timeout", 30)
         
         # Fix: Pop headers before the loop so retries don't lose custom headers
@@ -63,10 +61,18 @@ class GithubCrawler:
                     retry_after = int(response.headers.get("Retry-After", backoff))
                     logger.warning(f"Secondary rate limit (429) hit. Sleeping {retry_after}s...")
                     time.sleep(retry_after)
-                    # Note: We do NOT increment `attempt` here. Rate limits aren't network failures.
                     continue
+                
+                # Primary Rate Limit Exhaustion (Hard Wall - 403)
+                if response.status_code == 403:
+                    if int(response.headers.get("X-RateLimit-Remaining", 1)) == 0:
+                        reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
+                        sleep_seconds = max(reset_time - time.time() + 5, 60)
+                        logger.warning(f"Rate limit exhausted (403). Sleeping {sleep_seconds:.0f}s...")
+                        time.sleep(sleep_seconds)
+                        continue
                     
-                # Primary Rate Limit (Hourly quota protection - 403)
+                # Primary Rate Limit Warning (Preemptive slow-down)
                 remaining = int(response.headers.get("X-RateLimit-Remaining", 1))
                 if remaining < 50:
                     reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
@@ -85,6 +91,9 @@ class GithubCrawler:
                     raise
                 time.sleep(backoff)
                 backoff *= 2
+                
+        # Satisfy mypy and guarantee flow completeness
+        raise RuntimeError("Exhausted retries without returning a response or raising a specific exception.")
 
     def _fetch_paginated_list(self, url: str, params: dict = None) -> list:
         """Helper to exhaust all pages of a list endpoint using response.links."""
@@ -97,33 +106,36 @@ class GithubCrawler:
         
         while url:
             response = self._get(url, params=params)
-            all_results.extend(response.json())
+            
+            try:
+                all_results.extend(response.json())
+            # Catching ValueError handles JSONDecodeError across all requests versions safely
+            except ValueError as e:
+                logger.error(f"Malformed JSON response from {url}: {e}")
+                break
             
             # Cleanly parse the next page using requests native link parsing
             url = response.links.get("next", {}).get("url")
-            params = {}  # The 'next' URL already contains all query parameters
+            params = {}
             
         return all_results
 
     def fetch_merged_prs(self, per_page: int = 100) -> Generator[Dict, None, None]:
-        """
-        Streaming generator that yields ONLY strictly merged PRs.
-        Keeps memory flat regardless of repository size.
-        """
         url = f"{self.base_url}/repos/{self.repo_name}/pulls"
-        params = {
-            "state": "closed",
-            "per_page": per_page,
-            "sort": "updated",
-            "direction": "desc"
-        }
+        params = {"state": "closed", "per_page": per_page, "sort": "updated", "direction": "desc"}
         
         logger.info(f"Starting paginated fetch of merged PRs for {self.repo_name}...")
         
         while url:
             response = self._get(url, params=params)
             
-            for pr in response.json():
+            try:
+                data = response.json()
+            except ValueError as e:
+                logger.error(f"Failed to parse PR JSON from {url}: {e}")
+                break
+            
+            for pr in data:
                 if pr.get("merged_at") is not None:
                     yield pr
                     
@@ -155,10 +167,7 @@ class GithubCrawler:
             reviews = self._fetch_paginated_list(reviews_url)
             inline = self._fetch_paginated_list(inline_comments_url)
             
-            return PRCommentsData(
-                formal_reviews=reviews,
-                inline_comments=inline
-            )
+            return PRCommentsData(formal_reviews=reviews, inline_comments=inline)
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch fully paginated comments for PR #{pr_number}: {e}")
             return PRCommentsData(formal_reviews=[], inline_comments=[])

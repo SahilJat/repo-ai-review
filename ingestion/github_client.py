@@ -63,6 +63,24 @@ class GithubCrawler:
                     raise
                 time.sleep(backoff)
                 backoff *= 2
+    def _fetch_paginated_list(self, url: str, params: dict = None) -> list:
+        """Helper to exhaust all pages of a list endpoint using response.links."""
+        if params is None:
+            params = {"per_page": 100}
+        else:
+            params["per_page"] = 100
+            
+        all_results = []
+        
+        while url:
+            response = self._get(url, params=params)
+            all_results.extend(response.json())
+            
+            # Cleanly parse the next page using requests native link parsing
+            url = response.links.get("next", {}).get("url")
+            params = {}  # The 'next' URL already contains all query parameters
+            
+        return all_results
 
     def fetch_merged_prs(self, per_page: int = 100) -> Generator[Dict, None, None]:
         """
@@ -115,21 +133,19 @@ class GithubCrawler:
             logger.error(f"Failed to fetch diff for PR #{pr_number}: {e}")
             return None
 
-    def fetch_all_comments(self, pr_number: int) -> Dict[str, List[Dict]]:
-        """
-        Fetches both formal review states AND the crucial inline code comments.
-        """
+    def fetch_all_comments(self, pr_number: int) -> dict:
+        """Fetches all formal reviews and inline comments without silent truncation."""
         reviews_url = f"{self.base_url}/repos/{self.repo_name}/pulls/{pr_number}/reviews"
         inline_comments_url = f"{self.base_url}/repos/{self.repo_name}/pulls/{pr_number}/comments"
         
         try:
-            reviews = self._get(reviews_url).json()
-            inline = self._get(inline_comments_url).json()
+            reviews = self._fetch_paginated_list(reviews_url)
+            inline = self._fetch_paginated_list(inline_comments_url)
             
             return {
                 "formal_reviews": reviews,
                 "inline_comments": inline
             }
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch comments for PR #{pr_number}: {e}")
+            logger.error(f"Failed to fetch fully paginated comments for PR #{pr_number}: {e}")
             return {"formal_reviews": [], "inline_comments": []}

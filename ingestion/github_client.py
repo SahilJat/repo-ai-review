@@ -32,6 +32,15 @@ class GithubCrawler:
         # Connection pooling for high-throughput sequential requests
         self.session = requests.Session()
 
+    def __enter__(self):
+        """Enable context manager support for clean session teardown."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Close the TCP connection pool when exiting the 'with' block."""
+        self.session.close()
+        logger.debug("GitHub session closed cleanly.")
+
     def _get(self, url: str, **kwargs) -> requests.Response:
         """
         Bulletproof wrapper: Connection pooling, timeouts, and multi-tier rate limiting.
